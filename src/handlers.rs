@@ -37,6 +37,8 @@ use bdk_wallet::bitcoin::{secp256k1::Secp256k1, Txid};
 use bdk_wallet::bitcoin::{Amount, FeeRate, Psbt, Sequence};
 use bdk_wallet::descriptor::Segwitv0;
 use bdk_wallet::keys::bip39::WordCount;
+use payjoin::UriExt;
+use payjoin::send::SenderBuilder;
 #[cfg(feature = "sqlite")]
 use bdk_wallet::rusqlite::Connection;
 #[cfg(feature = "compiler")]
@@ -57,6 +59,7 @@ use std::convert::TryFrom;
 #[cfg(feature = "repl")]
 use std::io::Write;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[cfg(feature = "electrum")]
 use crate::utils::BlockchainClient::Electrum;
@@ -520,6 +523,102 @@ pub(crate) async fn handle_online_wallet_subcommand(
                 (None, None) => panic!("Missing `psbt` and `tx` option"),
             };
 
+            let txid = match client {
+                #[cfg(feature = "electrum")]
+                Electrum {
+                    client,
+                    batch_size: _,
+                } => client
+                    .transaction_broadcast(&tx)
+                    .map_err(|e| Error::Generic(e.to_string()))?,
+                #[cfg(feature = "esplora")]
+                Esplora {
+                    client,
+                    parallel_requests: _,
+                } => client
+                    .broadcast(&tx)
+                    .await
+                    .map(|()| tx.compute_txid())
+                    .map_err(|e| Error::Generic(e.to_string()))?,
+                #[cfg(feature = "rpc")]
+                RpcClient { client } => client
+                    .send_raw_transaction(&tx)
+                    .map_err(|e| Error::Generic(e.to_string()))?,
+            };
+            Ok(json!({ "txid": txid }))
+        },
+        SendPayjoin { uri, fee_rate } => {
+            // Set up the PayJoin URI for the network and with the extra fields.
+            let uri = payjoin::Uri::try_from(uri)
+                .map_err(|e| Error::Generic(format!("Failed parsing to PayJoin URI: {}", e)))?;
+            let uri = uri.require_network(wallet.network())
+                .map_err(|e| Error::Generic(format!("Failed setting the right network for the URI: {}", e)))?;
+            let uri = uri.check_pj_supported()
+                .map_err(|e| Error::Generic(format!("URI does not support PayJoin: {}", e)))?;
+            
+            let sats = uri.amount
+                .ok_or_else(|| Error::Generic("Amount is not specified in the URI.".to_string()))?;
+            
+            // In PayJoin terminology, original PSBT refers to the very first PSBT which is created by the sender.
+            // This will be sent to the payment receiver, have additional UTXOs added, 
+            // and received back before being broadcasted in the scope of this command. 
+            let original_psbt = {
+                let mut tx_builder = wallet.build_tx();
+                tx_builder
+                    .ordering(bdk_wallet::TxOrdering::Untouched)
+                    .add_recipient(uri.address.script_pubkey(), sats);
+                    
+                tx_builder.finish().map_err(|e| Error::Generic(format!("Error occurred when building original PayJoin transaction: {}", e)))?
+            };
+
+            // println!("{:#?}", original_psbt);
+
+            let req_ctx = SenderBuilder::from_psbt_and_uri(original_psbt, uri.clone())
+                .map_err(|e| Error::Generic(format!("Failed initializing PayJoin sender builder from PSBT and URI: {}", e)))?
+                .build_recommended(FeeRate::from_sat_per_vb(fee_rate as u64).expect("Provided fee rate is not valid."))
+                .map_err(|e| Error::Generic(format!("Failed initializing PayJoin sender using the transaction fee rate: {}", e)))?;
+
+            let (req, ctx) = req_ctx.extract_v2(uri.extras.endpoint().clone())
+                .map_err(|e| Error::Generic(format!("Failed extracting request and sender context: {}", e)))?;
+
+            let response = minreq::post(req.url)
+                .with_header("Content-Type", req.content_type)
+                .with_body(req.body)
+                .send()
+                .map_err(|e| Error::Generic(format!("Failed to make the initial v2 POST request: {}", e)))?;
+
+            let v2_ctx = Arc::new(ctx.process_response(response.as_bytes())
+                .map_err(|e| Error::Generic(format!("Failed when processing POST response with the sender context: {}", e)))?);
+            
+            let mut payjoin_psbt;
+            loop {
+                let (req, ohttp_ctx) = v2_ctx.extract_req(uri.extras.endpoint().clone())
+                    .map_err(|e| Error::Generic(format!("Failed when extracting request from the response context: {}", e)))?;
+                let response = minreq::post(req.url)
+                    .with_header("Content-Type", req.content_type)
+                    .with_body(req.body)
+                    .send()
+                    .map_err(|e| Error::Generic(format!("Failed to make the check v2 POST request: {}", e)))?;
+                match v2_ctx.process_response(response.as_bytes(), ohttp_ctx) {
+                    Ok(Some(psbt)) => {
+                        payjoin_psbt = psbt;
+                        break;
+                    },
+                    Ok(None) => {
+                        println!("No response yet. Waiting...")
+                    },
+                    Err(re) => {
+                        return Err(Error::Generic(format!("Something went wrong when polling from the directory: {}", re)));
+                    }
+                }
+            }
+
+            println!("PayJoin PSBT: {:#?}", payjoin_psbt);
+
+            let _ = wallet.sign(&mut payjoin_psbt, SignOptions::default());
+            is_final(&payjoin_psbt)?;
+
+            let tx = payjoin_psbt.extract_tx()?;
             let txid = match client {
                 #[cfg(feature = "electrum")]
                 Electrum {

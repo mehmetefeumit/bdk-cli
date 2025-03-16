@@ -381,7 +381,7 @@ pub enum OfflineWalletSubCommand {
 }
 
 /// Wallet subcommands that needs a blockchain backend.
-#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+#[derive(Debug, Subcommand, Clone, PartialEq)]
 #[command(rename_all = "snake")]
 #[cfg(any(
     feature = "electrum",
@@ -416,6 +416,15 @@ pub enum OnlineWalletSubCommand {
             conflicts_with = "psbt"
         )]
         tx: Option<String>,
+    },
+    /// Sends an original PSBT to a BIP 21 URI and broadcasts the returned PayJoin PSBT.
+    SendPayjoin {
+        /// BIP 21 URI to send to.
+        #[arg(env = "URI", long = "uri", required = true)]
+        uri: String,
+        /// Fee rate to use in sat/vbyte.
+        #[arg(env = "SATS_VBYTE", short = 'f', long = "fee_rate", required = true)]
+        fee_rate: f32,
     },
 }
 
